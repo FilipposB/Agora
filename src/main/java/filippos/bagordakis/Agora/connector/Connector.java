@@ -6,18 +6,22 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.jsontype.NamedType;
 
+import filippos.bagordakis.agora.agora.AgoraHelper;
+import filippos.bagordakis.agora.agora.data.dto.AckoledgmentDTO;
 import filippos.bagordakis.agora.agora.data.dto.BaseDTO;
 import filippos.bagordakis.agora.agora.data.dto.GreetingDTO;
 import filippos.bagordakis.agora.agora.data.dto.HeartbeatDTO;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 
 @Service
 public class Connector {
@@ -26,15 +30,16 @@ public class Connector {
 
 	private static final int PORT = 12345;
 
-	private ObjectMapper objectMapper;
+	private final ObjectMapper objectMapper = AgoraHelper.getObjectMapper();
 
 	private boolean running = false;
 
-	@PostConstruct
-	public void start() {
+	private ConcurrentLinkedQueue<BaseDTO> que;
 
-		this.objectMapper = new ObjectMapper();
-		objectMapper.registerSubtypes(new NamedType(GreetingDTO.class, "greeting"),  new NamedType(HeartbeatDTO.class, "heartbeat"));
+	@PostConstruct
+	public void start() throws JsonProcessingException {
+
+		que = new ConcurrentLinkedQueue<BaseDTO>();
 
 		log.info("Trying to open socket {}", PORT);
 		try (ServerSocket serverSocket = new ServerSocket(PORT)) {
@@ -50,8 +55,14 @@ public class Connector {
 
 	}
 
+	@PreDestroy
+	public void close() {
+		running = false;
+	}
+
 	private class ClientHandler implements Runnable {
 		private Socket socket;
+		private Writer writer;
 
 		public ClientHandler(Socket socket) {
 			this.socket = socket;
@@ -64,14 +75,26 @@ public class Connector {
 					BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
 				String jsonLine;
 				while ((jsonLine = reader.readLine()) != null) {
+					boolean sendAcknoledgment = true;
 					BaseDTO dto = objectMapper.readValue(jsonLine, BaseDTO.class);
 
-					if (dto instanceof GreetingDTO) {
-						GreetingDTO greetingDTO = (GreetingDTO) dto;
-						log.info("Received a GreetingDTO with name [{}] from", greetingDTO.getName());
-					} else if (dto instanceof HeartbeatDTO) {
-						log.info("Heartbeat");
-						out.println(jsonLine);
+					if (dto instanceof GreetingDTO greetingDTO) {
+						log.info("Received a GreetingDTO [{}] with name [{}] from", greetingDTO.getId(),
+								greetingDTO.getName());
+
+						if (writer == null) {
+							writer = new Writer(out);
+							new Thread(new Writer(out)).start();
+						}
+
+					} else if (dto instanceof HeartbeatDTO heartBeatDTO) {
+						sendAcknoledgment = false;
+						log.info("Heartbeat [{}] received from [{}]", dto.getId(), socket.getRemoteSocketAddress());
+						writer.sendHeartbeat(heartBeatDTO.getId(), jsonLine);
+					}
+
+					if (sendAcknoledgment) {
+						writer.sendAcknoledgment(dto.getId());
 					}
 				}
 			} catch (IOException e) {
@@ -84,5 +107,66 @@ public class Connector {
 				}
 			}
 		}
+
+		private class Writer implements Runnable {
+
+			private PrintWriter out;
+
+			public Writer(PrintWriter out) {
+				this.out = out;
+			}
+
+			@Override
+			public void run() {
+
+				log.info("Agora Writer started");
+
+				while (running) {
+
+					if (!socket.isConnected() || socket.isClosed()) {
+						running = false;
+						log.error("Socket is not connected or closed. Stopping sending data.");
+						break;
+					}
+					Object object = que.poll();
+					if (object != null) {
+						try {
+							String json = objectMapper.writeValueAsString(object);
+							out.println(json);
+							log.info("Sent object [{}] over TCP", json);
+						} catch (IOException e) {
+							log.error("Failed to serialize and send object", e);
+							running = false;
+						}
+
+					}
+
+					try {
+						Thread.sleep(1000);
+					} catch (InterruptedException e) {
+						e.printStackTrace();
+					}
+
+				}
+			}
+
+			public void sendHeartbeat(String id, String heartbeat) {
+				out.println(heartbeat);
+				log.info("Heartbeat [{}] sent to [{}]", id, socket.getRemoteSocketAddress());
+			}
+
+			public void sendAcknoledgment(String id) {
+				AckoledgmentDTO ackoledgmentDTO = new AckoledgmentDTO(id);
+				try {
+					out.println(objectMapper.writeValueAsString(ackoledgmentDTO));
+				} catch (JsonProcessingException e) {
+					log.error("Failed to send acknoledgment [{}] to [{}]", id, socket.getRemoteSocketAddress());
+					
+				}
+
+			}
+		}
+
 	}
+
 }
