@@ -8,8 +8,12 @@ import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,6 +21,7 @@ import org.springframework.stereotype.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 
+import filippos.bagordakis.Agora.connector.client.AgoraClientInformation;
 import filippos.bagordakis.agora.common.dto.AckoledgmentDTO;
 import filippos.bagordakis.agora.common.dto.BaseDTO;
 import filippos.bagordakis.agora.common.dto.GreetingDTO;
@@ -35,15 +40,19 @@ public class Connector {
 
 	private boolean running = false;
 
-	private ConcurrentLinkedQueue<BaseDTO> que;
+	private Map<AgoraClientInformation, ConcurrentLinkedQueue<BaseDTO>> que;
 	private final List<Socket> sockets = new ArrayList<Socket>();
+
+	public Connector() {
+
+	}
 
 	@PostConstruct
 	public void start() throws JsonProcessingException {
 
 		log.atInfo();
 
-		que = new ConcurrentLinkedQueue<BaseDTO>();
+		que = new ConcurrentHashMap<AgoraClientInformation, ConcurrentLinkedQueue<BaseDTO>>();
 
 		new Thread(() -> {
 			log.info("Trying to open socket {}", PORT);
@@ -79,11 +88,12 @@ public class Connector {
 
 		private Socket socket;
 		private Writer writer;
-		
-		private final AgoraRequestCache cache = new AgoraRequestCache(Duration.ofMillis(1000), x -> {
+		private AgoraClientInformation agoraClientInformation;
+
+		private final AgoraRequestCache cache = new AgoraRequestCache(Duration.ofMillis(2000), x -> {
 			if (x instanceof RequestDTO dto) {
 				log.info("Didnt hear back will reque !");
-				que.add(dto);
+				que.get(agoraClientInformation).add(dto);
 			}
 		});
 
@@ -97,21 +107,34 @@ public class Connector {
 			try (ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
 					ObjectInputStream reader = new ObjectInputStream(socket.getInputStream())) {
 
-				writer = new Writer(out);
-				new Thread(writer).start();
-
 				BaseDTO dto;
 
 				while ((dto = (BaseDTO) reader.readObject()) != null) {
 					boolean sendAcknoledgment = true;
 					Throwable error = null;
-					if (dto instanceof GreetingDTO greetingDTO) {
+					if (dto instanceof GreetingDTO greetingDTO && agoraClientInformation == null) {
+
 						log.info("Received a GreetingDTO [{}] with name [{}] from", greetingDTO.getId(),
-								greetingDTO.getName());
+								greetingDTO.getId());
+						agoraClientInformation = new AgoraClientInformation(greetingDTO.getName(), UUID.randomUUID());
+						que.put(agoraClientInformation, new ConcurrentLinkedQueue<BaseDTO>());
+
+						writer = new Writer(out);
+						new Thread(writer).start();
 					} else if (dto instanceof HeartbeatDTO heartBeatDTO) {
 						sendAcknoledgment = false;
 						log.debug("Heartbeat [{}] received from [{}]", dto.getId(), socket.getRemoteSocketAddress());
 						writer.sendHeartbeat(heartBeatDTO);
+					} else if (dto instanceof RequestDTO requestDTO) {
+						Stream<Entry<AgoraClientInformation, ConcurrentLinkedQueue<BaseDTO>>> stream = que.entrySet()
+								.stream().filter(x -> !x.getKey().equals(agoraClientInformation));
+						if (!requestDTO.getTarget().isEmpty()) {
+							stream.filter(x -> requestDTO.getTarget().contains(x.getKey().agoraID()));
+						}
+						stream.forEach(x -> que.get(x.getKey()).add(requestDTO));
+					} else if (dto instanceof AckoledgmentDTO acknoledgmentDTO) {
+						sendAcknoledgment = false;
+						cache.remove(acknoledgmentDTO);
 					}
 
 					if (sendAcknoledgment) {
@@ -149,7 +172,7 @@ public class Connector {
 						log.error("Socket is not connected or closed. Stopping sending data.");
 						break;
 					}
-					BaseDTO object = que.poll();
+					BaseDTO object = que.get(agoraClientInformation).poll();
 					if (object != null) {
 						try {
 							cache.put(object);
@@ -160,12 +183,6 @@ public class Connector {
 							running = false;
 						}
 
-					}
-
-					try {
-						Thread.sleep(1000);
-					} catch (InterruptedException e) {
-						e.printStackTrace();
 					}
 
 				}
