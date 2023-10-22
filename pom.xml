@@ -31,7 +31,7 @@
 		
 		<dependency>
 			<groupId>filippos.bagordakis</groupId>
-			<artifactId>agoraLib</artifactId>
+			<artifactId>agora-common</artifactId>
 			<version>0.0.1</version>
 		</dependency>
 		

@@ -1,11 +1,14 @@
 package filippos.bagordakis.Agora.connector;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import org.slf4j.Logger;
@@ -13,13 +16,13 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
-import filippos.bagordakis.agora.agora.AgoraHelper;
-import filippos.bagordakis.agora.agora.data.dto.AckoledgmentDTO;
-import filippos.bagordakis.agora.agora.data.dto.BaseDTO;
-import filippos.bagordakis.agora.agora.data.dto.GreetingDTO;
-import filippos.bagordakis.agora.agora.data.dto.HeartbeatDTO;
+import filippos.bagordakis.agora.common.dto.AckoledgmentDTO;
+import filippos.bagordakis.agora.common.dto.BaseDTO;
+import filippos.bagordakis.agora.common.dto.GreetingDTO;
+import filippos.bagordakis.agora.common.dto.HeartbeatDTO;
+import filippos.bagordakis.agora.common.dto.RequestDTO;
+import filippos.bagordakis.agora.common.request.cache.AgoraRequestCache;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 
@@ -30,39 +33,59 @@ public class Connector {
 
 	private static final int PORT = 12345;
 
-	private final ObjectMapper objectMapper = AgoraHelper.getObjectMapper();
-
 	private boolean running = false;
 
 	private ConcurrentLinkedQueue<BaseDTO> que;
+	private final List<Socket> sockets = new ArrayList<Socket>();
 
 	@PostConstruct
 	public void start() throws JsonProcessingException {
 
+		log.atInfo();
+
 		que = new ConcurrentLinkedQueue<BaseDTO>();
 
-		log.info("Trying to open socket {}", PORT);
-		try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-			running = true;
-			log.info("Socket is open, Listening");
-			while (running) {
-				Socket clientSocket = serverSocket.accept();
-				new Thread(new ClientHandler(clientSocket)).start();
+		new Thread(() -> {
+			log.info("Trying to open socket {}", PORT);
+			try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+				running = true;
+				log.info("Socket is open, Listening");
+				while (running) {
+					Socket clientSocket = serverSocket.accept();
+					sockets.add(clientSocket);
+					new Thread(new ClientHandler(clientSocket)).start();
+				}
+			} catch (Exception e) {
+				log.error("Failed to open socket {}", PORT);
 			}
-		} catch (Exception e) {
-			log.error("Failed to open socket {}", PORT);
-		}
+		}).start();
 
 	}
 
 	@PreDestroy
 	public void close() {
 		running = false;
+		sockets.forEach(t -> {
+			try {
+				t.close();
+				log.info("Connection with [{}] was shut down", t.getRemoteSocketAddress());
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		});
 	}
 
 	private class ClientHandler implements Runnable {
+
 		private Socket socket;
 		private Writer writer;
+		
+		private final AgoraRequestCache cache = new AgoraRequestCache(Duration.ofMillis(1000), x -> {
+			if (x instanceof RequestDTO dto) {
+				log.info("Didnt hear back will reque !");
+				que.add(dto);
+			}
+		});
 
 		public ClientHandler(Socket socket) {
 			this.socket = socket;
@@ -71,34 +94,32 @@ public class Connector {
 		@Override
 		public void run() {
 			log.info("Connected to client: " + socket.getRemoteSocketAddress());
-			try (PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-					BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
-				String jsonLine;
-				while ((jsonLine = reader.readLine()) != null) {
-					boolean sendAcknoledgment = true;
-					BaseDTO dto = objectMapper.readValue(jsonLine, BaseDTO.class);
+			try (ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+					ObjectInputStream reader = new ObjectInputStream(socket.getInputStream())) {
 
+				writer = new Writer(out);
+				new Thread(writer).start();
+
+				BaseDTO dto;
+
+				while ((dto = (BaseDTO) reader.readObject()) != null) {
+					boolean sendAcknoledgment = true;
+					Throwable error = null;
 					if (dto instanceof GreetingDTO greetingDTO) {
 						log.info("Received a GreetingDTO [{}] with name [{}] from", greetingDTO.getId(),
 								greetingDTO.getName());
-
-						if (writer == null) {
-							writer = new Writer(out);
-							new Thread(new Writer(out)).start();
-						}
-
 					} else if (dto instanceof HeartbeatDTO heartBeatDTO) {
 						sendAcknoledgment = false;
-						log.info("Heartbeat [{}] received from [{}]", dto.getId(), socket.getRemoteSocketAddress());
-						writer.sendHeartbeat(heartBeatDTO.getId(), jsonLine);
+						log.debug("Heartbeat [{}] received from [{}]", dto.getId(), socket.getRemoteSocketAddress());
+						writer.sendHeartbeat(heartBeatDTO);
 					}
 
 					if (sendAcknoledgment) {
-						writer.sendAcknoledgment(dto.getId());
+						writer.sendAcknoledgment(dto.getId(), error);
 					}
 				}
-			} catch (IOException e) {
-				e.printStackTrace();
+			} catch (IOException | ClassNotFoundException e) {
+
 			} finally {
 				try {
 					socket.close();
@@ -110,16 +131,16 @@ public class Connector {
 
 		private class Writer implements Runnable {
 
-			private PrintWriter out;
+			private ObjectOutputStream out;
 
-			public Writer(PrintWriter out) {
+			public Writer(ObjectOutputStream out) {
 				this.out = out;
 			}
 
 			@Override
 			public void run() {
 
-				log.info("Agora Writer started");
+				log.info("Agora Writer started {}", socket.getRemoteSocketAddress());
 
 				while (running) {
 
@@ -128,12 +149,12 @@ public class Connector {
 						log.error("Socket is not connected or closed. Stopping sending data.");
 						break;
 					}
-					Object object = que.poll();
+					BaseDTO object = que.poll();
 					if (object != null) {
 						try {
-							String json = objectMapper.writeValueAsString(object);
-							out.println(json);
-							log.info("Sent object [{}] over TCP", json);
+							cache.put(object);
+							out.writeObject(object);
+							log.info("Sent object [{}] over TCP", object.getClass());
 						} catch (IOException e) {
 							log.error("Failed to serialize and send object", e);
 							running = false;
@@ -150,20 +171,22 @@ public class Connector {
 				}
 			}
 
-			public void sendHeartbeat(String id, String heartbeat) {
-				out.println(heartbeat);
-				log.info("Heartbeat [{}] sent to [{}]", id, socket.getRemoteSocketAddress());
+			public void sendHeartbeat(HeartbeatDTO heartbeat) {
+				try {
+					out.writeObject(heartbeat);
+					log.debug("Heartbeat [{}] sent to [{}]", heartbeat.getId(), socket.getRemoteSocketAddress());
+				} catch (IOException e) {
+					e.printStackTrace();
+				}
 			}
 
-			public void sendAcknoledgment(String id) {
-				AckoledgmentDTO ackoledgmentDTO = new AckoledgmentDTO(id);
+			public void sendAcknoledgment(UUID id, Throwable error) {
+				AckoledgmentDTO ackoledgmentDTO = new AckoledgmentDTO(id, error);
 				try {
-					out.println(objectMapper.writeValueAsString(ackoledgmentDTO));
-				} catch (JsonProcessingException e) {
-					log.error("Failed to send acknoledgment [{}] to [{}]", id, socket.getRemoteSocketAddress());
-					
+					out.writeObject(ackoledgmentDTO);
+				} catch (IOException e) {
+					e.printStackTrace();
 				}
-
 			}
 		}
 
