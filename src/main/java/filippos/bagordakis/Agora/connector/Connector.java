@@ -19,8 +19,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-
 import filippos.bagordakis.Agora.connector.client.AgoraClientInformation;
 import filippos.bagordakis.agora.common.dto.AckoledgmentDTO;
 import filippos.bagordakis.agora.common.dto.BaseDTO;
@@ -48,7 +46,7 @@ public class Connector {
 	}
 
 	@PostConstruct
-	public void start() throws JsonProcessingException {
+	public void start() {
 
 		log.atInfo();
 
@@ -89,6 +87,7 @@ public class Connector {
 		private Socket socket;
 		private Writer writer;
 		private AgoraClientInformation agoraClientInformation;
+		private boolean clientRunning;
 
 		private final AgoraRequestCache cache = new AgoraRequestCache(Duration.ofMillis(2000), x -> {
 			if (x instanceof RequestDTO dto) {
@@ -99,6 +98,7 @@ public class Connector {
 
 		public ClientHandler(Socket socket) {
 			this.socket = socket;
+			this.clientRunning = running;
 		}
 
 		@Override
@@ -109,18 +109,19 @@ public class Connector {
 
 				BaseDTO dto;
 
-				while ((dto = (BaseDTO) reader.readObject()) != null) {
+				while (clientRunning && (dto = (BaseDTO) reader.readObject()) != null) {
 					boolean sendAcknoledgment = true;
 					Throwable error = null;
-					if (dto instanceof GreetingDTO greetingDTO && agoraClientInformation == null) {
+					if (agoraClientInformation == null) {
+						if (dto instanceof GreetingDTO greetingDTO) {
+							log.info("Received a GreetingDTO [{}] with name [{}] from", greetingDTO.getId(),
+									greetingDTO.getId());
+							agoraClientInformation = new AgoraClientInformation(greetingDTO.getName(), UUID.randomUUID());
+							que.put(agoraClientInformation, new ConcurrentLinkedQueue<BaseDTO>());
 
-						log.info("Received a GreetingDTO [{}] with name [{}] from", greetingDTO.getId(),
-								greetingDTO.getId());
-						agoraClientInformation = new AgoraClientInformation(greetingDTO.getName(), UUID.randomUUID());
-						que.put(agoraClientInformation, new ConcurrentLinkedQueue<BaseDTO>());
-
-						writer = new Writer(out);
-						new Thread(writer).start();
+							writer = new Writer(out);
+							new Thread(writer).start();
+						}
 					} else if (dto instanceof HeartbeatDTO heartBeatDTO) {
 						sendAcknoledgment = false;
 						log.debug("Heartbeat [{}] received from [{}]", dto.getId(), socket.getRemoteSocketAddress());
@@ -145,10 +146,15 @@ public class Connector {
 
 			} finally {
 				try {
-					socket.close();
+					clientRunning = false;
+					if (que.containsKey(agoraClientInformation))
+						que.remove(agoraClientInformation);
+					if (socket.isConnected())
+						socket.close();
 				} catch (IOException e) {
 					e.printStackTrace();
 				}
+				log.error("Client [{}] was shutdown", agoraClientInformation.marketID());
 			}
 		}
 
@@ -165,10 +171,9 @@ public class Connector {
 
 				log.info("Agora Writer started {}", socket.getRemoteSocketAddress());
 
-				while (running) {
+				while (clientRunning) {
 
 					if (!socket.isConnected() || socket.isClosed()) {
-						running = false;
 						log.error("Socket is not connected or closed. Stopping sending data.");
 						break;
 					}
@@ -180,12 +185,12 @@ public class Connector {
 							log.info("Sent object [{}] over TCP", object.getClass());
 						} catch (IOException e) {
 							log.error("Failed to serialize and send object", e);
-							running = false;
 						}
 
 					}
 
 				}
+				clientRunning = false;
 			}
 
 			public void sendHeartbeat(HeartbeatDTO heartbeat) {
